@@ -165,13 +165,15 @@ int main(void)
     vTaskStartScheduler();	
 
     while(1)
-    {}
+    {
+    ds_resp_run();
+    }
   #else
     // No RTOS task here so just call the main loop here.
     // Loop forever responding to ranging requests.
     while (1)
     {
-      ss_resp_run();
+      ds_resp_run();
     }
     #endif  // #ifdef USE_FREERTOS
 }
