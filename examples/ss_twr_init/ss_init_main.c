@@ -200,14 +200,10 @@ int ds_init_run(void)
 {
     int err;
 
-    if (distance == NULL) {
-        return -3;
-    }
-
+    printf("In ds_init_run \n");
     if ((err = send_poll()) < 0) {
         return err;
     }
-
     if ((err = ds_rx_response()) < 0) {
         return err;
     }
@@ -220,6 +216,8 @@ int ds_init_run(void)
     if ((err = rx_report(&distance)) < 0) {
         return err;
     }
+
+    printf("d=%f",distance);
 
     return 0;
 }
@@ -259,6 +257,8 @@ void ss_initiator_task_function (void * pvParameter)
   //dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
 
   dwt_setleds(DWT_LEDS_ENABLE);
+
+  printf("In ss_init_task_func");
 
   while (true)
   {
