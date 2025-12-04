@@ -25,24 +25,19 @@
 #include "deca_device_api.h"
 #include "deca_regs.h"
 #include "port_platform.h"
+#include "init_resp_common.h"
 
 /* Inter-ranging delay period, in milliseconds. See NOTE 1*/
 #define RNG_DELAY_MS 80
 
-/* Frames used in the ranging process. See NOTE 2,3 below. */
-static uint8 rx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0xE0, 0, 0};
-static uint8 tx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-
-// Beluga messages
-//static uint8 rx_poll_msg[POLL_MSG_LEN] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W',
-//                                          'A',  0,    0, 0x61, 0,    0};
-//static uint8 tx_resp_msg[RESP_MSG_LEN] = {
-//    0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0x50,
-//    0,    0,    0, 0,    0,    0,   0,   0,   0,   0};
-static uint8 rx_final_msg[24] = {
+static uint8 rx_poll_msg[POLL_MSG_LEN] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W',
+                                          'A',  0,    0, 0x61, 0,    0};
+static uint8 tx_resp_msg[RESP_MSG_LEN] = {
+    0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0x50,
+    0,    0,    0, 0,    0,    0,   0,   0,   0,   0};
+static uint8 rx_final_msg[FINAL_MSG_LEN] = {
     0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x69, 0, 0,
     0,    0,    0, 0,    0,    0,   0,   0,   0,   0,    0, 0};
-#define REPORT_MSG_LEN 16
 static uint8 tx_report_msg[REPORT_MSG_LEN] = {
     0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE3, 0, 0, 0, 0, 0, 0};
 
@@ -73,181 +68,192 @@ static uint32 status_reg = 0;
 // Not enough time to write the data so TX timeout extended for nRF operation.
 // Might be able to get away with 800 uSec but would have to test
 // See note 6 at the end of this file
-#define POLL_RX_TO_RESP_TX_DLY_UUS  1100
+#define POLL_RX_TO_RESP_TX_DLY_UUS 1500
+#define RX_BUF_LEN MAX(POLL_MSG_LEN, FINAL_MSG_LEN)
 
-/* This is the delay from the end of the frame transmission to the enable of the receiver, as programmed for the DW1000's wait for response feature. */
-#define RESP_TX_TO_FINAL_RX_DLY_UUS 500
+static int wait_poll_message(uint16_t *src_id, uint32_t *logic_clk) {
+    uint32 status_reg, frame_len;
 
-/* Timestamps of frames transmission/reception.
-* As they are 40-bit wide, we need to define a 64-bit int type to handle them. */
-typedef signed long long int64;
-typedef unsigned long long uint64;
-static uint64 poll_rx_ts;
-
-/* Declaration of static functions. */
-//static uint64 get_tx_timestamp_u64(void);
-static uint64 get_rx_timestamp_u64(void);
-static void resp_msg_set_ts(uint8 *ts_field, const uint64 ts);
-//static void final_msg_get_ts(const uint8 *ts_field, uint32 *ts);
-
-/* Timestamps of frames transmission/reception.
-* As they are 40-bit wide, we need to define a 64-bit int type to handle them. */
-typedef unsigned long long uint64;
-static uint64 poll_rx_ts;
-static uint64 resp_tx_ts;
-
-#define POLL_RX_TO_RESP_TX_UUS 1500
-#define FINAL_MSG_POLL_TX_TS_IDX 10
-#define FINAL_MSG_RESP_RX_TS_IDX (FINAL_MSG_POLL_TX_TS_IDX + 4)
-#define FINAL_MSG_FINAL_TX_TS_IDX (FINAL_MSG_RESP_RX_TS_IDX + 4)
-#define SPEED_OF_LIGHT 299702547
-#define TIMESTAMP_OVERHEAD 4
-
-static inline void msg_set_ts(uint8 *ts_field, const uint64_t ts) {
-    int i;
-    for (i = 0; i < TIMESTAMP_OVERHEAD; i++) {
-        ts_field[i] = (ts >> (i * 8)) & 0xFF;
-    }
-}
-
-static inline void msg_get_ts(const uint8_t *ts_field, uint32_t *ts) {
-    int i;
-    *ts = 0;
-    for (i = 0; i < TIMESTAMP_OVERHEAD; i++) {
-        *ts += ts_field[i] << (i * 8);
-    }
-}
-
-int ds_resp_run(void)
-{
-    /* Enable RX for POLL */
     dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
-    while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
-        (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_ERR)))
-    {}
+    UWB_WAIT(
+        (status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
+        (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
+
+    }
 
     if (!(status_reg & SYS_STATUS_RXFCG)) {
-        dwt_rxreset(); // Making it into this case after initiator transmits
+        dwt_write32bitreg(SYS_STATUS_ID,
+                          SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        dwt_rxreset();
         return -1;
     }
 
-    /* --------------------
-     * 1. RECEIVED POLL
-     * -------------------- */
-
-    uint32 frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_MASK;
     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
-    dwt_readrxdata(rx_buffer, frame_len, 0);
 
-    uint32 poll_rx_ts = dwt_readrxtimestamplo32();
-
-    /* --------------------
-     * 2. SEND RESP
-     * -------------------- */
-    uint32 resp_tx_time =
-        (poll_rx_ts + (POLL_RX_TO_RESP_TX_UUS * UUS_TO_DWT_TIME)) >> 8;
-
-    dwt_setdelayedtrxtime(resp_tx_time);
-
-    uint64 resp_tx_ts = (((uint64)resp_tx_time) << 8) + TX_ANT_DLY;
-
-    dwt_writetxdata(sizeof(tx_resp_msg), tx_resp_msg, 0);
-    dwt_writetxfctrl(sizeof(tx_resp_msg), 0, 1);
-
-    if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS)
-    {
-        dwt_rxreset();
-        return -2;
+    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFL_MASK_1023;
+    if (frame_len <= RX_BUFFER_LEN) {
+        dwt_readrxdata(rx_buffer, frame_len, 0);
     }
 
-    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS)) {}
-    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
-
-    /* --------------------
-     * 3. WAIT FOR FINAL
-     * -------------------- */
-    dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-    while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
-        (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO)))
-    {}
-
-    if (!(status_reg & SYS_STATUS_RXFCG)) {
-        dwt_rxreset();
-        return -3;
+    rx_buffer[SEQ_CNT_OFFSET] = 0;
+    *src_id = get_src_id(rx_buffer);
+    rx_buffer[SRC_OFFSET] = 0;
+    rx_buffer[SRC_OFFSET + 1] = 0;
+    GET_EXCHANGE_ID(rx_buffer + LOGIC_CLK_OFFSET, *logic_clk);
+    SET_EXCHANGE_ID(rx_buffer + LOGIC_CLK_OFFSET, 0);
+    if (!(memcmp(rx_buffer, rx_poll_msg, DW_BASE_LEN) == 0)) {
+        return -1;
     }
-
-    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_MASK;
-    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
-    dwt_readrxdata(rx_buffer, frame_len, 0);
-
-    uint32 final_rx_ts = dwt_readrxtimestamplo32();
-
-    /* extract the 3 timestamps from FINAL */
-    uint32 poll_tx_ts, resp_rx_ts, final_tx_ts;
-    msg_get_ts(&rx_buffer[FINAL_MSG_POLL_TX_TS_IDX], &poll_tx_ts);
-    msg_get_ts(&rx_buffer[FINAL_MSG_RESP_RX_TS_IDX], &resp_rx_ts);
-    msg_get_ts(&rx_buffer[FINAL_MSG_FINAL_TX_TS_IDX], &final_tx_ts);
-
-    /* --------------------
-     * 4. Compute DS-TWR ToF
-     * -------------------- */
-    uint32 Ra = resp_rx_ts - poll_tx_ts;
-    uint32 Rb = final_rx_ts - resp_tx_ts;
-    uint32 Da = final_tx_ts - resp_rx_ts;
-    uint32 Db = resp_tx_ts - poll_rx_ts;
-
-    double tof_dtu = ((Ra * Rb) - (Da * Db)) / (Ra + Rb + Da + Db);
-
-
-    // Send report message back to initiator
-    // because Segger sucks
-
-    uint64 tof_dtu_int = (uint64)(tof_dtu);
-
-    msg_set_ts(&tx_report_msg[10], tof_dtu_int);
-
-    /* send immediately */
-    dwt_writetxdata(sizeof(tx_report_msg), tx_report_msg, 0);
-    dwt_writetxfctrl(sizeof(tx_report_msg), 0, 1);
-
-    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS)
-    {
-        dwt_rxreset();
-        return -4;
-    }
-
-    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS)) {}
-    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
-
 
     return 0;
 }
 
-/*! ------------------------------------------------------------------------------------------------------------------
-* @fn get_rx_timestamp_u64()
-*
-* @brief Get the RX time-stamp in a 64-bit variable.
-*        /!\ This function assumes that length of time-stamps is 40 bits, for both TX and RX!
-*
-* @param  none
-*
-* @return  64-bit value of the read time-stamp.
-*/
-static uint64 get_rx_timestamp_u64(void)
-{
-  uint8 ts_tab[5];
-  uint64 ts = 0;
-  int i;
-  dwt_readrxtimestamp(ts_tab);
-  for (i = 4; i >= 0; i--)
-  {
-    ts <<= 8;
-    ts |= ts_tab[i];
-  }
-  return ts;
+
+static int ds_respond(uint64_t *poll_rx_ts) {
+    uint32 resp_tx_time;
+    int ret;
+
+    *poll_rx_ts = get_rx_timestamp_u64();
+
+    resp_tx_time =
+        (*poll_rx_ts + (POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8;
+    dwt_setdelayedtrxtime(resp_tx_time);
+
+    dwt_writetxdata(sizeof(tx_resp_msg), tx_resp_msg, 0);
+    dwt_writetxfctrl(sizeof(tx_resp_msg), 0, 1);
+
+    ret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+
+    if (ret != DWT_SUCCESS) {
+        dwt_rxreset();
+        return -1;
+    }
+
+    UWB_WAIT(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS);
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
+
+    return 0;
 }
+
+
+
+static int wait_final(uint64 *tof_dtu, const uint64_t *poll_rx_ts) {
+    uint32 status_reg, frame_len, poll_rx_ts_32, resp_tx_ts_32, final_rx_ts_32;
+    uint32_t resp_rx_ts, poll_tx_ts, final_tx_ts;
+    uint64_t final_rx_ts, resp_tx_ts;
+    double roundA, replyA, roundB, replyB;
+
+    UWB_WAIT(
+        (status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
+        (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
+
+    }
+
+    if (!(status_reg & SYS_STATUS_RXFCG)) {
+        dwt_write32bitreg(SYS_STATUS_ID,
+                          SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        dwt_rxreset();
+        return -1;
+    }
+
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
+
+    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFL_MASK_1023;
+    if (frame_len <= RX_BUFFER_LEN) {
+        dwt_readrxdata(rx_buffer, frame_len, 0);
+    }
+
+    rx_buffer[SEQ_CNT_OFFSET] = 0;
+
+    if (!(memcmp(rx_buffer, rx_final_msg, DW_BASE_LEN) == 0)) {
+        return -1;
+    }
+
+    final_rx_ts = get_rx_timestamp_u64();
+    resp_tx_ts = get_tx_timestamp_u64();
+
+    msg_get_ts(&rx_buffer[RESP_MSG_POLL_RX_TS_IDX], &poll_tx_ts);
+    msg_get_ts(&rx_buffer[RESP_MSG_RESP_TX_TS_IDX], &resp_rx_ts);
+    msg_get_ts(&rx_buffer[FINAL_MSG_FINAL_TX_TS_IDX], &final_tx_ts);
+
+    poll_rx_ts_32 = (uint32)(*poll_rx_ts);
+    resp_tx_ts_32 = (uint32)resp_tx_ts;
+    final_rx_ts_32 = (uint32)final_rx_ts;
+    roundB = (double)(final_rx_ts_32 - resp_tx_ts_32);
+    replyB = (double)(resp_tx_ts_32 - poll_rx_ts_32);
+    roundA = (double)(resp_rx_ts - poll_tx_ts);
+    replyA = (double)(final_tx_ts - resp_rx_ts);
+
+    if ((roundA * roundB - replyA * replyB) <= 0) {
+        return -3;
+    }
+
+    *tof_dtu = (uint64)((roundA * roundB - replyA * replyB) /
+                        (roundA + roundB + replyA + replyB));
+
+    return 0;
+}
+
+
+static int send_report(uint64 tof_dtu) {
+    int ret;
+
+    msg_set_ts(&tx_report_msg[RESP_MSG_POLL_RX_TS_IDX], tof_dtu);
+
+    dwt_writetxdata(sizeof(tx_report_msg), tx_report_msg, 0);
+    dwt_writetxfctrl(sizeof(tx_report_msg), 0, 1);
+    ret = dwt_starttx(DWT_START_TX_IMMEDIATE);
+
+    if (ret != DWT_SUCCESS) {
+        dwt_rxreset();
+        return -1;
+    }
+
+    UWB_WAIT(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS);
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
+
+    return 0;
+}
+
+
+int ds_resp_run() {
+    int err;
+    uint16_t src_id = 1;
+    uint16_t id = 2;
+    uint64 tof_dtu;
+    uint64_t poll_rx_ts;
+    uint32_t _logic_clk = 0;
+
+
+    if ((err = wait_poll_message(&src_id, &_logic_clk)) < 0) {
+        return err;
+    }
+
+    set_dest_id(src_id, tx_resp_msg);
+    SET_EXCHANGE_ID(tx_resp_msg + LOGIC_CLK_OFFSET, _logic_clk);
+
+    if ((err = ds_respond(&poll_rx_ts)) < 0) {
+        return err;
+    }
+
+    set_src_id(src_id, rx_final_msg);
+    SET_EXCHANGE_ID(rx_final_msg + LOGIC_CLK_OFFSET, _logic_clk);
+
+    if ((err = wait_final(&tof_dtu, &poll_rx_ts)) < 0) {
+        return err;
+    }
+
+    set_dest_id(src_id, tx_report_msg);
+    SET_EXCHANGE_ID(tx_report_msg + LOGIC_CLK_OFFSET, _logic_clk);
+
+    if ((err = send_report(tof_dtu)) < 0) {
+        return err;
+    }
+
+    return 0;
+}
+
 
 /*! ------------------------------------------------------------------------------------------------------------------
 * @fn final_msg_set_ts()

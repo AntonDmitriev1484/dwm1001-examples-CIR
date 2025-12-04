@@ -70,10 +70,6 @@ static uint32 status_reg = 0;
 static double tof;
 static double distance;
 
-/* Declaration of static functions. */
-static void resp_msg_get_ts(uint8 *ts_field, uint32 *ts);
-
-
 /*Transactions Counters */
 static volatile int tx_count = 0 ; // Successful transmit counter
 static volatile int rx_count = 0 ; // Successful receive counter 
