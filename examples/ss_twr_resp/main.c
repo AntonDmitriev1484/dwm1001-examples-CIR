@@ -38,6 +38,8 @@
 #include "deca_param_types.h"
 #include "deca_regs.h"
 #include "deca_device_api.h"
+#include "SEGGER_RTT.h"
+
 
 // Defines ---------------------------------------------
 

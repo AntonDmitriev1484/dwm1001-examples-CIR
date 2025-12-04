@@ -33,6 +33,19 @@
 static uint8 rx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0xE0, 0, 0};
 static uint8 tx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
+// Beluga messages
+//static uint8 rx_poll_msg[POLL_MSG_LEN] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W',
+//                                          'A',  0,    0, 0x61, 0,    0};
+//static uint8 tx_resp_msg[RESP_MSG_LEN] = {
+//    0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0x50,
+//    0,    0,    0, 0,    0,    0,   0,   0,   0,   0};
+static uint8 rx_final_msg[24] = {
+    0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x69, 0, 0,
+    0,    0,    0, 0,    0,    0,   0,   0,   0,   0,    0, 0};
+#define REPORT_MSG_LEN 16
+static uint8 tx_report_msg[REPORT_MSG_LEN] = {
+    0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE3, 0, 0, 0, 0, 0, 0};
+
 /* Length of the common part of the message (up to and including the function code, see NOTE 3 below). */
 #define ALL_MSG_COMMON_LEN 10
 
@@ -197,6 +210,140 @@ int ss_resp_run(void)
   return(1);		
 }
 
+#define POLL_RX_TO_RESP_TX_UUS 1500
+#define FINAL_MSG_POLL_TX_TS_IDX 10
+#define FINAL_MSG_RESP_RX_TS_IDX (FINAL_MSG_POLL_TX_TS_IDX + 4)
+#define FINAL_MSG_FINAL_TX_TS_IDX (FINAL_MSG_RESP_RX_TS_IDX + 4)
+#define SPEED_OF_LIGHT 299702547
+#define TIMESTAMP_OVERHEAD 4
+
+static inline void msg_set_ts(uint8 *ts_field, const uint64_t ts) {
+    int i;
+    for (i = 0; i < TIMESTAMP_OVERHEAD; i++) {
+        ts_field[i] = (ts >> (i * 8)) & 0xFF;
+    }
+}
+
+static inline void msg_get_ts(const uint8_t *ts_field, uint32_t *ts) {
+    int i;
+    *ts = 0;
+    for (i = 0; i < TIMESTAMP_OVERHEAD; i++) {
+        *ts += ts_field[i] << (i * 8);
+    }
+}
+
+int ds_resp_run(void)
+{
+    /* Enable RX for POLL */
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+    while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
+        (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO)))
+    {}
+
+    if (!(status_reg & SYS_STATUS_RXFCG)) {
+        dwt_rxreset();
+        return -1;
+    }
+
+    /* --------------------
+     * 1. RECEIVED POLL
+     * -------------------- */
+
+    uint32 frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_MASK;
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
+    dwt_readrxdata(rx_buffer, frame_len, 0);
+
+    uint32 poll_rx_ts = dwt_readrxtimestamplo32();
+
+    /* --------------------
+     * 2. SEND RESP
+     * -------------------- */
+    uint32 resp_tx_time =
+        (poll_rx_ts + (POLL_RX_TO_RESP_TX_UUS * UUS_TO_DWT_TIME)) >> 8;
+
+    dwt_setdelayedtrxtime(resp_tx_time);
+
+    uint64 resp_tx_ts = (((uint64)resp_tx_time) << 8) + TX_ANT_DLY;
+
+    resp_msg_set_ts(&tx_resp_msg[RESP_MSG_POLL_RX_TS_IDX], poll_rx_ts);
+    resp_msg_set_ts(&tx_resp_msg[RESP_MSG_RESP_TX_TS_IDX], resp_tx_ts);
+
+    tx_resp_msg[ALL_MSG_SN_IDX] = frame_seq_nb++;
+
+    dwt_writetxdata(sizeof(tx_resp_msg), tx_resp_msg, 0);
+    dwt_writetxfctrl(sizeof(tx_resp_msg), 0, 1);
+
+    if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS)
+    {
+        dwt_rxreset();
+        return -2;
+    }
+
+    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS)) {}
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
+
+    /* --------------------
+     * 3. WAIT FOR FINAL
+     * -------------------- */
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+    while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
+        (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO)))
+    {}
+
+    if (!(status_reg & SYS_STATUS_RXFCG)) {
+        dwt_rxreset();
+        return -3;
+    }
+
+    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_MASK;
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
+    dwt_readrxdata(rx_buffer, frame_len, 0);
+
+    uint32 final_rx_ts = dwt_readrxtimestamplo32();
+
+    /* extract the 3 timestamps from FINAL */
+    uint32 poll_tx_ts, resp_rx_ts, final_tx_ts;
+    msg_get_ts(&rx_buffer[FINAL_MSG_POLL_TX_TS_IDX], &poll_tx_ts);
+    msg_get_ts(&rx_buffer[FINAL_MSG_RESP_RX_TS_IDX], &resp_rx_ts);
+    msg_get_ts(&rx_buffer[FINAL_MSG_FINAL_TX_TS_IDX], &final_tx_ts);
+
+    /* --------------------
+     * 4. Compute DS-TWR ToF
+     * -------------------- */
+    uint32 Ra = resp_rx_ts - poll_tx_ts;
+    uint32 Rb = final_rx_ts - resp_tx_ts;
+    uint32 Da = final_tx_ts - resp_rx_ts;
+    uint32 Db = resp_tx_ts - poll_rx_ts;
+
+    double tof_dtu = ((Ra * Rb) - (Da * Db)) / (Ra + Rb + Da + Db);
+
+
+    // Send report message back to initiator
+    // because Segger sucks
+
+    uint64 tof_dtu_int = (uint64)(tof_dtu);
+
+    msg_set_ts(&tx_report_msg[10], tof_dtu_int);
+
+    /* send immediately */
+    dwt_writetxdata(sizeof(tx_report_msg), tx_report_msg, 0);
+    dwt_writetxfctrl(sizeof(tx_report_msg), 0, 1);
+
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS)
+    {
+        dwt_rxreset();
+        return -4;
+    }
+
+    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS)) {}
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
+
+
+    return 0;
+}
+
 /*! ------------------------------------------------------------------------------------------------------------------
 * @fn get_rx_timestamp_u64()
 *
@@ -254,64 +401,9 @@ void ss_responder_task_function (void * pvParameter)
 
   while (true)
   {
-    ss_resp_run();
+    ds_resp_run();
     /* Delay a task for a given number of ticks */
     vTaskDelay(RNG_DELAY_MS);
     /* Tasks must be implemented to never return... */
   }
 }
-/*****************************************************************************************************************************************************
-* NOTES:
-*
-* 1. This is the task delay when using FreeRTOS. Task is delayed a given number of ticks. Useful to be able to define this out to see the effect of the RTOS
-*    on timing.
-* 2. The frames used here are Decawave specific ranging frames, complying with the IEEE 802.15.4 standard data frame encoding. The frames are the
-*    following:
-*     - a poll message sent by the initiator to trigger the ranging exchange.
-*     - a response message sent by the responder to complete the exchange and provide all information needed by the initiator to compute the
-*       time-of-flight (distance) estimate.
-*    The first 10 bytes of those frame are common and are composed of the following fields:
-*     - byte 0/1: frame control (0x8841 to indicate a data frame using 16-bit addressing).
-*     - byte 2: sequence number, incremented for each new frame.
-*     - byte 3/4: PAN ID (0xDECA).
-*     - byte 5/6: destination address, see NOTE 3 below.
-*     - byte 7/8: source address, see NOTE 3 below.
-*     - byte 9: function code (specific values to indicate which message it is in the ranging process).
-*    The remaining bytes are specific to each message as follows:
-*    Poll message:
-*     - no more data
-*    Response message:
-*     - byte 10 -> 13: poll message reception timestamp.
-*     - byte 14 -> 17: response message transmission timestamp.
-*    All messages end with a 2-byte checksum automatically set by DW1000.
-* 3. Source and destination addresses are hard coded constants in this example to keep it simple but for a real product every device should have a
-*    unique ID. Here, 16-bit addressing is used to keep the messages as short as possible but, in an actual application, this should be done only
-*    after an exchange of specific messages used to define those short addresses for each device participating to the ranging exchange.
-* 4. dwt_writetxdata() takes the full size of the message as a parameter but only copies (size - 2) bytes as the check-sum at the end of the frame is
-*    automatically appended by the DW1000. This means that our variable could be two bytes shorter without losing any data (but the sizeof would not
-*    work anymore then as we would still have to indicate the full length of the frame to dwt_writetxdata()).
-* 5. We use polled mode of operation here to keep the example as simple as possible but all status events can be used to generate interrupts. Please
-*    refer to DW1000 User Manual for more details on "interrupts". It is also to be noted that STATUS register is 5 bytes long but, as the event we
-*    use are all in the first bytes of the register, we can use the simple dwt_read32bitreg() API call to access it instead of reading the whole 5
-*    bytes.
-* 6. POLL_RX_TO_RESP_TX_DLY_UUS is a critical value for porting to different processors. For slower platforms where the SPI is at a slower speed 
-*    or the processor is operating at a lower frequency (Comparing to STM32F, SPI of 18MHz and Processor internal 72MHz)this value needs to be increased.
-*    Knowing the exact time when the responder is going to send its response is vital for time of flight calculation. The specification of the time of 
-*    respnse must allow the processor enough time to do its calculations and put the packet in the Tx buffer. So more time required for a slower
-*    system(processor).
-* 7. As we want to send final TX timestamp in the final message, we have to compute it in advance instead of relying on the reading of DW1000
-*    register. Timestamps and delayed transmission time are both expressed in device time units so we just have to add the desired response delay to
-*    response RX timestamp to get final transmission time. The delayed transmission time resolution is 512 device time units which means that the
-*    lower 9 bits of the obtained value must be zeroed. This also allows to encode the 40-bit value in a 32-bit words by shifting the all-zero lower
-*    8 bits.
-* 8. In this operation, the high order byte of each 40-bit timestamps is discarded. This is acceptable as those time-stamps are not separated by
-*    more than 2**32 device time units (which is around 67 ms) which means that the calculation of the round-trip delays (needed in the
-*    time-of-flight computation) can be handled by a 32-bit subtraction.
-* 9. dwt_writetxdata() takes the full size of the message as a parameter but only copies (size - 2) bytes as the check-sum at the end of the frame is
-*    automatically appended by the DW1000. This means that our variable could be two bytes shorter without losing any data (but the sizeof would not
-*    work anymore then as we would still have to indicate the full length of the frame to dwt_writetxdata()).
-*10. The user is referred to DecaRanging ARM application (distributed with EVK1000 product) for additional practical example of usage, and to the
-*    DW1000 API Guide for more details on the DW1000 driver functions.
-*
-****************************************************************************************************************************************************/
- 
