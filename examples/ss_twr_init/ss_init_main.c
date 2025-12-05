@@ -26,10 +26,26 @@
 #include "deca_device_api.h"
 #include "deca_regs.h"
 #include "port_platform.h"
+#include "deca_device_api.h"
 
 #include "init_resp_common.h"
+#include "SEGGER_RTT.h"
 
 #define APP_NAME "SS TWR INIT v1.3"
+
+
+#define N_CIR_SAMPLES 128
+
+typedef struct {
+    int16 real;  // Use int16 (DecaDriver style) not int16_t
+    int16 imag;
+}  cir_sample_t;
+
+typedef struct {
+    float range;
+    dwt_rxdiag_t diagnostics;
+    cir_sample_t cir_samples[N_CIR_SAMPLES] __attribute__((aligned(4)));
+} __attribute__((packed)) range_packet_t;
 
 /* Inter-ranging delay period, in milliseconds. */
 #define RNG_DELAY_MS 100
@@ -160,7 +176,7 @@ static int send_final(void) {
     return 0;
 }
 
-static int rx_report(double *distance) {
+static int rx_report(double *distance, cir_sample_t* cir_samples, dwt_rxdiag_t* diag) {
     uint32 status_reg, frame_len;
     uint32_t msg_tof_dtu;
     double tof;
@@ -177,30 +193,51 @@ static int rx_report(double *distance) {
 
     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
 
-    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFL_MASK_1023;
-    if (frame_len <= RX_BUFFER_LEN) {
-        dwt_readrxdata(rx_buffer, frame_len, 0);
+    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_MASK;
+    if (frame_len > RX_BUFFER_LEN) {
+        dwt_rxreset();
+        return -2;
     }
+
+    dwt_readrxdata(rx_buffer, frame_len, 0);
 
     rx_buffer[SEQ_CNT_OFFSET] = 0;
 
-    if (!(memcmp(rx_buffer, rx_report_msg, DW_BASE_LEN) == 0)) {
-        return -1;
+    if (memcmp(rx_buffer, rx_report_msg, DW_BASE_LEN) != 0) {
+        return -3;
     }
 
+    // Compute ToF
     msg_get_ts(&rx_buffer[RESP_MSG_POLL_RX_TS_IDX], &msg_tof_dtu);
     tof = msg_tof_dtu * DWT_TIME_UNITS;
     *distance = tof * SPEED_OF_LIGHT;
-    //dwt_readdiagnostics(diag);
+
+    // Diagnostics
+    dwt_readdiagnostics(diag);
+
+    // CIR
+    uint16 fp_index = diag->firstPath >> 6;
+    int start = fp_index - (N_CIR_SAMPLES / 2);
+    if (start < 0) start = 0;
+    if (start + N_CIR_SAMPLES > 1024) start = 1024 - N_CIR_SAMPLES;
+
+    uint16 accOffset = start * sizeof(cir_sample_t);
+    uint16 N_bytes = N_CIR_SAMPLES * sizeof(cir_sample_t);
+
+    dwt_readaccdata((uint8_t*)cir_samples, N_bytes, accOffset);
 
     return 0;
 }
 
+
+
+static range_packet_t packet; // Allocating this on stack will create hardfault!!!
+
 int ds_init_run(void)
 {
+    // Getting mem fault somewhere in here
     int err;
 
-    printf("In ds_init_run \n");
     if ((err = send_poll()) < 0) {
         return err;
     }
@@ -212,12 +249,24 @@ int ds_init_run(void)
         return err;
     }
 
+    
     double distance;
-    if ((err = rx_report(&distance)) < 0) {
+    dwt_rxdiag_t decawave_diag;
+    //cir_sample_t samples[N_CIR_SAMPLES];
+    if ((err = rx_report(&distance, packet.cir_samples, &decawave_diag)) < 0) {
         return err;
-    }
+    } // Actually seems to make it through this entire function
 
     printf("d=%f",distance);
+
+    
+    packet.range = distance;
+    packet.diagnostics = decawave_diag;
+    //memcpy(packet.cir_samples, samples, N_CIR_SAMPLES *sizeof(cir_sample_t));
+
+    //printf("packet size %d", sizeof(range_packet_t));
+
+    //SEGGER_RTT_Write(0, (uint8_t*)&packet, sizeof(packet));
 
     return 0;
 }
@@ -258,7 +307,14 @@ void ss_initiator_task_function (void * pvParameter)
 
   dwt_setleds(DWT_LEDS_ENABLE);
 
+  SEGGER_RTT_WriteString(0, "Hello from DWM1001!\n");
   printf("In ss_init_task_func");
+
+  // Can do
+  //  int32_t values[5] = {1, 2, 3, 4, 5};
+  //SEGGER_RTT_Write(0, (uint8_t*)values, sizeof(values));
+
+  //Can also send structured packets (see GPT)
 
   while (true)
   {
