@@ -1,4 +1,4 @@
-import serial
+import pylink
 import struct
 import json
 import csv
@@ -8,51 +8,48 @@ import numpy as np
 import os
 import shutil
 
-# -------------------------
-# Update these based on your definition!
-# -------------------------
-N_CIR_SAMPLES = 128  # <-- CHANGE THIS TO MATCH YOUR FIRMWARE
+# Boost Python process priority on Windows
+p = psutil.Process(os.getpid())
+p.nice(psutil.HIGH_PRIORITY_CLASS)
 
-# cir_sample_t = int16 real, int16 imag
+# ------------------------- Firmware-specific parameters -------------------------
+N_CIR_SAMPLES = 128
+TOTAL_PACKET_SIZE = 532
+
 CIR_SAMPLE_FORMAT = "<hh"
-CIR_SAMPLE_SIZE = struct.calcsize(CIR_SAMPLE_FORMAT)  # = 4 bytes
+CIR_SAMPLE_SIZE = struct.calcsize(CIR_SAMPLE_FORMAT)
 
-# dwt_rxdiag_t = 8 × uint16
 RX_DIAG_FORMAT = "<8H"
-RX_DIAG_SIZE = struct.calcsize(RX_DIAG_FORMAT)        # = 16 bytes
+RX_DIAG_SIZE = struct.calcsize(RX_DIAG_FORMAT)
 
-# float range
 RANGE_FORMAT = "<f"
-RANGE_SIZE = struct.calcsize(RANGE_FORMAT)            # = 4 bytes
+RANGE_SIZE = struct.calcsize(RANGE_FORMAT)
 
-TOTAL_PACKET_SIZE = RANGE_SIZE + RX_DIAG_SIZE + N_CIR_SAMPLES * CIR_SAMPLE_SIZE
-# Should equal: 20 + 4*N_CIR_SAMPLES
 print("Total packet size:", TOTAL_PACKET_SIZE)
 
-# ---------------------------------------------------------
-# Decode a full packet
-# ---------------------------------------------------------
-def read_packet(ser):
-    data = ser.read(TOTAL_PACKET_SIZE)
-    if len(data) != TOTAL_PACKET_SIZE:
-        print(len(data))
-        return None
-    
+# ------------------------- Helper functions -------------------------
+def read_full_packet(jlink, size, channel=0):
+    """Read exactly 'size' bytes from RTT Up buffer."""
+    data = bytearray()
+    while len(data) < size:
+        chunk = jlink.rtt_read(channel, size - len(data))
+        if not chunk:
+            time.sleep(0.001)
+            continue
+        data.extend(chunk)
+    return data
 
+def parse_packet(data):
     offset = 0
-
-    # float range
     (range_val,) = struct.unpack_from(RANGE_FORMAT, data, offset)
     offset += RANGE_SIZE
 
-    # 8 × uint16 rx diagnostics
     diagnostics = np.array(
         struct.unpack_from(RX_DIAG_FORMAT, data, offset),
         dtype=np.uint16
     )
     offset += RX_DIAG_SIZE
 
-    # CIR: N samples × (int16,int16)
     cir = np.frombuffer(
         data,
         dtype=np.int16,
@@ -60,22 +57,14 @@ def read_packet(ser):
         offset=offset
     ).reshape((N_CIR_SAMPLES, 2))
 
-    packet = {
+    return {
         "timestamp": time.time_ns() / 1e3,
         "range": float(range_val),
         "diagnostics": diagnostics,
         "cir": cir,
     }
 
-    print(packet)
-
-    return 
-
-# ----------------------------------------------
-# Save as JSON
-# ----------------------------------------------
 def save_json(filename, packets):
-    # Convert numpy → lists
     json_data = []
     for p in packets:
         json_data.append({
@@ -84,14 +73,9 @@ def save_json(filename, packets):
             "diagnostics": p["diagnostics"].tolist(),
             "cir": p["cir"].tolist(),
         })
-
     with open(filename, "w") as f:
         json.dump(json_data, f, indent=2)
 
-# ----------------------------------------------
-# Save CSV (range + timestamp only)
-# CIR goes in separate CSV
-# ----------------------------------------------
 def save_csv(filename, packets):
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
@@ -104,49 +88,45 @@ def save_cir_csv(prefix, packets):
         cir_file = f"{prefix}_cir_{idx}.csv"
         np.savetxt(cir_file, p["cir"], delimiter=",", fmt="%d")
 
-# ----------------------------------------------
-# Main
-# ----------------------------------------------
+# ------------------------- Main -------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Decode DWM1001 range_packet_t stream")
-    parser.add_argument("trial", help = "Trial name")
-    parser.add_argument("port", help="COM port (COM4, /dev/ttyUSB0, etc.)")
+    parser = argparse.ArgumentParser(description="Decode DWM1001 range_packet_t stream via PyLink RTT")
+    parser.add_argument("trial", help="Trial name")
+    parser.add_argument("--serial", type=int, default=None, help="J-Link serial number")
     args = parser.parse_args()
 
-    BAUD = 115200
+    print("Connecting to J-Link...")
+    jlink = pylink.JLink()
+    if args.serial:
+        jlink.open(serial_no=args.serial)
+    else:
+        jlink.open()
+    print(f"Connected: {jlink.product_name} ({jlink.serial_number})")
 
-    PORT = f"COM{args.port}"
-    ser = serial.Serial(PORT, BAUD, timeout=2)
-    print(f"Listening on {PORT} at {BAUD}...")
-    print("Press CTRL+C to stop and save.")
+    jlink.rtt_start()
+    print("RTT started.")
 
     packets = []
-
     try:
         while True:
-            pkt = read_packet(ser)
-            if pkt:
-                packets.append(pkt)
-                print(f"Packet {len(packets)}: range={pkt['range']:.3f} m")
-            else:
-                print("Timeout or partial packet...")
+            data = read_full_packet(jlink, TOTAL_PACKET_SIZE)
+            packet = parse_packet(data)
+            packets.append(packet)
+            print(f"Packet {len(packets)}: range={packet['range']:.3f} m")
     except KeyboardInterrupt:
         print("\nCTRL+C detected — stopping capture.")
     finally:
-        ser.close()
+        jlink.rtt_stop()
+        jlink.close()
 
-    OUTPATH = f"C:\\Users\\soula\\OneDrive\\Desktop\\Programming\\dwm1001-examples-CIR\\out\\{args.trial}"
-    # If directory exists → delete it completely
+    OUTPATH = os.path.join("examples\\out", args.trial)
     if os.path.exists(OUTPATH):
         shutil.rmtree(OUTPATH)
-
-    # Recreate it cleanly
     os.makedirs(OUTPATH)
 
-    # Save outputs after interrupt
-    save_json(f"{OUTPATH}\\packets.json", packets)
-    save_csv(f"{OUTPATH}\\ranges.csv", packets)
-    save_cir_csv(f"{OUTPATH}\\cir", packets)
+    save_json(os.path.join(OUTPATH, "packets.json"), packets)
+    save_csv(os.path.join(OUTPATH, "ranges.csv"), packets)
+    save_cir_csv(os.path.join(OUTPATH, "cir"), packets)
 
     print("Saved packets.json, ranges.csv, cir_*.csv")
 

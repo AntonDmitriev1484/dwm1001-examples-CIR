@@ -30,10 +30,12 @@
 
 #include "init_resp_common.h"
 #include "SEGGER_RTT.h"
+#include "rtt_semaphore.h"
 
 #define APP_NAME "SS TWR INIT v1.3"
 
-
+// Really can not get more than this or it will Hardfault
+// likely because the first path +- N_CIR_SAMPLES/2 goes out of buffer bounds???
 #define N_CIR_SAMPLES 128
 
 typedef struct {
@@ -45,7 +47,7 @@ typedef struct {
     float range;
     dwt_rxdiag_t diagnostics;
     cir_sample_t cir_samples[N_CIR_SAMPLES] __attribute__((aligned(4)));
-} __attribute__((packed)) range_packet_t;
+} range_packet_t;
 
 /* Inter-ranging delay period, in milliseconds. */
 #define RNG_DELAY_MS 100
@@ -217,13 +219,14 @@ static int rx_report(double *distance, cir_sample_t* cir_samples, dwt_rxdiag_t* 
 
     // CIR
     uint16 fp_index = diag->firstPath >> 6;
-    int start = fp_index - (N_CIR_SAMPLES / 2);
+    int32 start = (int32)fp_index - (N_CIR_SAMPLES / 2);
     if (start < 0) start = 0;
     if (start + N_CIR_SAMPLES > 1024) start = 1024 - N_CIR_SAMPLES;
 
-    uint16 accOffset = start * sizeof(cir_sample_t);
+    uint16 accOffset = (uint16)(start * sizeof(cir_sample_t));
     uint16 N_bytes = N_CIR_SAMPLES * sizeof(cir_sample_t);
 
+    // buffer must be aligned 4-byte
     dwt_readaccdata((uint8_t*)cir_samples, N_bytes, accOffset);
 
     return 0;
@@ -232,9 +235,25 @@ static int rx_report(double *distance, cir_sample_t* cir_samples, dwt_rxdiag_t* 
 
 
 static range_packet_t packet; // Allocating this on stack will create hardfault!!!
+// I think my problems in raising N_CIR_SAMPLES come more from how I read from the RX buffer, rather than alignment of the cir array
+
+void send_packet_over_rtt(range_packet_t* packet)
+{
+    if (xSemaphoreTake(rtt_mutex, portMAX_DELAY))
+    {
+        // Have to increase Segger RTT buffer size in order to log the full packet
+        printf("packet size %d", sizeof(range_packet_t));
+        int bytes_written = SEGGER_RTT_Write(0, (uint8_t*)packet, sizeof(range_packet_t));
+        printf("RTT wrote %d bytes\n", bytes_written);
+        xSemaphoreGive(rtt_mutex);
+    }
+}
 
 int ds_init_run(void)
 {
+
+            // Sleep/delay for 100 ms (convert to ticks)
+     vTaskDelay(pdMS_TO_TICKS(100));
     // Getting mem fault somewhere in here
     int err;
 
@@ -257,41 +276,19 @@ int ds_init_run(void)
         return err;
     } // Actually seems to make it through this entire function
 
-    printf("d=%f",distance);
+    //printf("d=%f",distance);
 
     
     packet.range = distance;
     packet.diagnostics = decawave_diag;
-    //memcpy(packet.cir_samples, samples, N_CIR_SAMPLES *sizeof(cir_sample_t));
+    //memcpy(packet.cir_samples, cir_samples_buf, N_CIR_SAMPLES * sizeof(cir_sample_t));
+    //packet.cir_samples = cir_samples_buf;
 
-    //printf("packet size %d", sizeof(range_packet_t));
+    send_packet_over_rtt(&packet);
 
-    //SEGGER_RTT_Write(0, (uint8_t*)&packet, sizeof(packet));
+
 
     return 0;
-}
-
-
-
-/*! ------------------------------------------------------------------------------------------------------------------
-* @fn resp_msg_get_ts()
-*
-* @brief Read a given timestamp value from the response message. In the timestamp fields of the response message, the
-*        least significant byte is at the lower address.
-*
-* @param  ts_field  pointer on the first byte of the timestamp field to get
-*         ts  timestamp value
-*
-* @return none
-*/
-static void resp_msg_get_ts(uint8 *ts_field, uint32 *ts)
-{
-  int i;
-  *ts = 0;
-  for (i = 0; i < RESP_MSG_TS_LEN; i++)
-  {
-    *ts += ts_field[i] << (i * 8);
-  }
 }
 
 
@@ -307,14 +304,8 @@ void ss_initiator_task_function (void * pvParameter)
 
   dwt_setleds(DWT_LEDS_ENABLE);
 
-  SEGGER_RTT_WriteString(0, "Hello from DWM1001!\n");
+  //SEGGER_RTT_WriteString(0, "Hello from DWM1001!\n");
   printf("In ss_init_task_func");
-
-  // Can do
-  //  int32_t values[5] = {1, 2, 3, 4, 5};
-  //SEGGER_RTT_Write(0, (uint8_t*)values, sizeof(values));
-
-  //Can also send structured packets (see GPT)
 
   while (true)
   {

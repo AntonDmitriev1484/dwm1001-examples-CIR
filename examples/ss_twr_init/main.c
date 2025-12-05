@@ -35,6 +35,8 @@
 #include "deca_regs.h"
 #include "deca_device_api.h"
 #include "uart.h"
+#include "semphr.h"
+#include "rtt_semaphore.h"
 	
 //-----------------dw1000----------------------------
 
@@ -108,6 +110,14 @@ static void led_toggle_timer_callback (void * pvParameter)
 
 #endif   // #ifdef USE_FREERTOS
 
+SemaphoreHandle_t rtt_mutex = NULL; // extern defined in init_resp_common
+
+//                                                    packet size 532RTT wrote 0 bytes
+//                          Singled Sided Two Way Ranging Initiator Example
+//In ss_init_task_funcpacket size 532RTT wrote 532 bytes
+//                                                      packet size 532RTT wrote 532 bytes
+//        packet size 532RTT wrote 532 bytes
+
 int main(void)
 {
   /* Setup some LEDs for debug Green and Blue on DWM1001-DEV */
@@ -123,7 +133,10 @@ int main(void)
     UNUSED_VARIABLE(xTimerStart(led_toggle_timer_handle, 0));
 
     /* Create task for SS TWR Initiator set to 2 */
-    UNUSED_VARIABLE(xTaskCreate(ss_initiator_task_function, "SSTWR_INIT", configMINIMAL_STACK_SIZE + 200, NULL, 2, &ss_initiator_task_handle));
+    // Changing the stack causes this to silently just not run lmfao
+    // TODO try to change stack size here. Might help memory issues.
+    int INITIATOR_TASK_STACK = 60;
+    UNUSED_VARIABLE(xTaskCreate(ss_initiator_task_function, "SSTWR_INIT", INITIATOR_TASK_STACK + 200, NULL, 1, &ss_initiator_task_handle));
   #endif // #ifdef USE_FREERTOS
   
   //-------------dw1000  ini------------------------------------	
@@ -169,21 +182,23 @@ int main(void)
   //-------------dw1000  ini------end---------------------------	
   // IF WE GET HERE THEN THE LEDS WILL BLINK
 
-  #ifdef USE_FREERTOS		
+
+
+    rtt_mutex = xSemaphoreCreateMutex();
+    if (rtt_mutex == NULL)
+    {
+       printf("Mutex creation failed");
+    }
+
+#ifdef USE_FREERTOS
     /* Start FreeRTOS scheduler. */
     vTaskStartScheduler();	
 
-    while(1) 
-    {};
-  #else
-
-    // No RTOS task here so just call the main loop here.
-    // Loop forever responding to ranging requests.
-    while (1)
+    while(1)
     {
-     
+        ds_init_run();
     }
+#endif
 
-  #endif
 }
 

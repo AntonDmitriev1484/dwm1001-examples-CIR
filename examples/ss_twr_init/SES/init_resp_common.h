@@ -18,6 +18,9 @@
 #include <deca_device_api.h>
 #include <zephyr/kernel.h>
 
+#include "semphr.h"
+#include "rtt_semaphore.h"
+
 /**
  * The number of bytes needed for the Frame control
  */
